@@ -56,3 +56,16 @@ jobs:
           pnpm install --frozen-lockfile
       - name: Run focused existing frontend tests
         run: pnpm test app/javascript/shared/helpers/specs/DateHelper.spec.js app/javascript/widget/helpers/specs/urlParamsHelper.spec.js
+
+  isolated-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify capacity on disposable runner
+        run: df -h /
+      - name: Build, start, test, restart and restore isolated synthetic application
+        run: python3 -B docker/isolated/verify_runtime.py
