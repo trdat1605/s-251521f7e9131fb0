@@ -1,0 +1,63 @@
+name: Portable foundation checks
+
+on:
+  pull_request:
+    paths:
+      - docker/Dockerfile
+      - docker/isolated/**
+      - .github/workflows/foundation-ci.yml
+  workflow_dispatch:
+    inputs:
+      frontend_checks:
+        description: Install frontend dependencies and run focused tests on manual runs
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: foundation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Python boundary tests
+        run: python3 -B -m unittest discover -s docker/isolated -v
+      - name: Create disposable Git-equipped regression image
+        run: |
+          docker build --tag cwdev-ci-metadata - <<'DOCKERFILE'
+          FROM alpine:3.21
+          RUN apk add --no-cache git
+          DOCKERFILE
+      - name: Real upstream baseline and fixed metadata Docker regression
+        run: |
+          regression_image_id="$(docker image inspect --format '{{.Id}}' cwdev-ci-metadata)"
+          python3 -B docker/isolated/bootstrap.py metadata-regression --base-image "$regression_image_id"
+
+  focused-frontend:
+    if: github.event_name == 'pull_request' || inputs.frontend_checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.22.1
+      - name: Install pinned package manager and locked dependencies
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.2.0 --activate
+          pnpm install --frozen-lockfile
+      - name: Run focused existing frontend tests
+        run: pnpm test app/javascript/shared/helpers/specs/DateHelper.spec.js app/javascript/widget/helpers/specs/urlParamsHelper.spec.js
+
