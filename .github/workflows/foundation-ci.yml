@@ -65,7 +65,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify capacity on disposable runner
+      - name: Report capacity on disposable runner
         run: df -h /
+      # verify_runtime.py enforces the measured 15 GiB free-space gate before preparing/building.
       - name: Build, start, test, restart and restore isolated synthetic application
         run: python3 -B docker/isolated/verify_runtime.py

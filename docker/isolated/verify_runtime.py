@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -73,6 +74,10 @@ def main():
                      "-At", "-c", query], "synthetic_counts_" + database).strip().splitlines()
 
     try:
+        free_bytes = shutil.disk_usage(root).free
+        evidence["capacity"] = {"free_bytes": free_bytes, "minimum_bytes": 15 * 1024 ** 3}
+        if free_bytes < 15 * 1024 ** 3:
+            raise RuntimeError("Insufficient runner capacity: require 15 GiB free before allocation")
         call([sys.executable, "-B", "docker/isolated/bootstrap.py", "--project", project,
               "prepare", "--port-base", "44440"], "prepare")
         state = bootstrap.read_state(root, project)
@@ -122,7 +127,10 @@ def main():
             try:
                 boot("stop", "stop_owned_services")
             except Exception:
-                evidence["cleanup"] = "NOT_VERIFIED"
+                evidence["cleanup"] = "FAIL"
+                evidence["status"] = "FAIL"
+                evidence["exit_code"] = 1
+                evidence.setdefault("failed_step", "stop_owned_services")
         print("FOUNDATION_RUNTIME_EVIDENCE " + json.dumps(evidence, sort_keys=True))
     return evidence["exit_code"]
 
