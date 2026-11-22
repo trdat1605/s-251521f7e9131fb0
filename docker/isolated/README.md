@@ -65,9 +65,11 @@ Run from the application checkout after the runtime plan has been reviewed:
 The build command builds the upstream-derived development base image first.
 Rails, Sidekiq and Vite use that same image and /gems dependencies. After building,
 a disposable container reads /app/.git_sha and must match recorded Git HEAD.
-The node_modules volume is seeded from the image. The scoped entrypoint checks
-gems or performs a frozen-lockfile frontend installation without the upstream
-Vite forced reinstall, Rails PID deletion or shared cache deletion.
+The private node_modules volume is seeded from the image. The scoped entrypoint
+checks that gems or the prebuilt Vite executable are available; it never runs
+pnpm install during service startup. Missing dependencies fail with a build
+instruction. Dependency changes require a new image/project. It does not perform
+the upstream Vite forced reinstall, Rails PID deletion or shared cache deletion.
 
 The URL is http://localhost:44440/app/login and Mailhog is localhost:44442.
 smoke checks an HTTP login-page response; it does not prove interactive login,
@@ -122,6 +124,14 @@ First run Python boundaries:
 
     python3 -B -m unittest discover -s docker/isolated -v
 
+This regression reads the baseline Git object
+caab07a8f00032d5205b5a5d7e2eb0ba2f3d2d82. A shallow clone may not contain it.
+Check it before the regression; if absent, fetch that exact public upstream
+commit, without modifying the checkout or application data:
+
+    git cat-file -e caab07a8f00032d5205b5a5d7e2eb0ba2f3d2d82^{commit}
+    git fetch https://github.com/chatwoot/chatwoot.git caab07a8f00032d5205b5a5d7e2eb0ba2f3d2d82
+
 After review, supply an exact local image ID containing Git (no host mounts):
 
     python3 -B docker/isolated/bootstrap.py metadata-regression --base-image sha256:REPLACE_WITH_64_HEX_ID
@@ -137,12 +147,35 @@ registration and uniquely tagged test images are removed; shared images and
 unrelated worktrees/containers/volumes are retained.
 
 foundation-ci.yml runs these Python and Docker regressions on every pull
-requests and manual invocation. It has contents:read only, no secrets, publish,
+request and manual invocation. It has contents:read only, no secrets, publish,
 push or schedule trigger. PR frontend checks (optional on manual runs) install locked
 dependencies and run existing focused Vitest tests. Enabling this workflow and
 disabling inherited publish/scheduled workflows is a separate reviewed repository
 operation. File existence is not evidence of CI execution or successful runtime
 reproduction.
+
+## Disposable hosted-runner lifecycle verification
+
+The CI isolated-runtime job invokes:
+
+    python3 -B docker/isolated/verify_runtime.py
+
+This helper is intended for a disposable Linux runner with Docker, Compose,
+Python, Git, network access and at least 15 GiB free before allocation. It uses
+the fixed project cwdev-ci-runtime and ports 44440–44442. Do not invoke it on a
+shared development host or alongside another run with those identities. It
+performs a full build, prepares synthetic development/test databases, checks
+API/login/Vite/Mailhog HTTP responses, runs focused application tests, restarts
+its services, dumps the synthetic database in memory and restores it into a
+new database, then checks selected row counts and repeated preparation.
+
+The final FOUNDATION_RUNTIME_EVIDENCE JSON binds the result to actual Git HEAD.
+A failed step or failure to stop owned services exits nonzero. It stops only
+its project; it does not remove volumes or images, which the disposable hosted
+runner discards. A passing run proves only these checks on that runner. It
+does not verify interactive browser login, all features, a production deployment
+or recovery of real customer data. Use the manual workflow above for an approved
+local project and record its separate evidence.
 
 ## Sources and ownership
 
@@ -154,8 +187,9 @@ reproduction.
 - [BuildKit image-ID compatibility issue](https://github.com/moby/buildkit/issues/2204): local image IDs in FROM can be interpreted as repository/tag references; a verified owned named tag avoids that syntax.
 
 Application issue: https://github.com/trdat1605/s-251521f7e9131fb0/issues/2.
-Control task: tasks/COMPLETE-001/task.json in the separate coordination repository.
+Control task: [COMPLETE-001](https://github.com/trdat1605/r-61974bac4c68fe3c/blob/codex/complete-foundation/tasks/COMPLETE-001/task.json)
+in the separate coordination repository; [completion checkpoint](https://github.com/trdat1605/r-61974bac4c68fe3c/blob/codex/complete-foundation/docs/development/completion.md).
+These are working-branch links, not acceptance records; final review receipts
+must name immutable control and app commit SHAs separately.
 Runtime acceptance, browser checks, backup/restore evidence, exact-commit review,
 PR integration and merge/release decisions remain separate recorded steps.
-
-Startup uses dependencies already installed into the development image and seeded into its private node_modules volume. It does not run pnpm install on service startup: that operation can prompt to reinstall a relocated modules directory. Missing frontend dependencies fail with a build instruction. Dependency changes require a new image/project, preserving the recorded source snapshot.
