@@ -14,6 +14,18 @@ ignored .env or .codex contents. The generated build context and runtime source
 snapshot are separate: application writes cannot change the build context or
 the original checkout.
 
+One nonruntime developer-rule pointer is explicitly omitted from generated
+archives: .windsurf/rules/chatwoot.md, only when it is a symlink with the pinned
+upstream target ../../AGENTS.md. This upstream link is internal, not unsafe or
+dangling. The local Python 3.10.12 tarfile data filter resolves its linkname
+against the extraction root instead of the symlink's parent, incorrectly
+reporting it outside the destination. The omission avoids that compatibility
+defect without disabling or replacing the data filter. A changed type or target
+at this exact path requires review; other paths are filtered normally.
+All extracted members still use filter="data", other external links remain
+rejected, normal internal links remain supported, and root AGENTS.md is retained.
+state.json records the exact archive_omission_policy; no host AGENTS is followed.
+
 ## Requirements and boundaries
 
 Use Linux, Git, Python with tarfile's data extraction filter (verified locally on
@@ -78,6 +90,13 @@ For a constrained local verification, prepare a different project with
     python3 -B docker/isolated/bootstrap.py --project cwdev-cached001 prepare --port-base 44443 --reuse-base-image sha256:REPLACE_WITH_64_HEX_ID
 
 The selected image must already contain compatible /gems and /app/node_modules.
+The CLI retains the exact image ID as provenance. At build time it creates an
+owned random cwdev-base-...:selected local tag and verifies that tag resolves
+to the selected ID before and after the build. The Dockerfile uses that named
+reference, because a local image ID is not a registry digest and BuildKit may
+interpret FROM sha256:... as a repository/tag. Only the generated temporary tag
+is removed, after an ID check; existing lab tags are never retagged or removed.
+If a temporary tag changes identity, cleanup leaves it untouched and fails.
 The generated Dockerfile retains those dependencies, removes inherited /app
 source/adapters inside the image, copies the clean source archive and writes
 verified source metadata. This path is recorded as CACHE_REUSE. It proves neither
@@ -110,7 +129,7 @@ fallback without copying user Git config/credentials. Generated fixture worktree
 registration and uniquely tagged test images are removed; shared images and
 unrelated worktrees/containers/volumes are retained.
 
-foundation-ci.yml runs these Python and Docker regressions on matching pull
+foundation-ci.yml runs these Python and Docker regressions on every pull
 requests and manual invocation. It has contents:read only, no secrets, publish,
 push or schedule trigger. PR frontend checks (optional on manual runs) install locked
 dependencies and run existing focused Vitest tests. Enabling this workflow and
@@ -125,6 +144,7 @@ reproduction.
 - [Git linked-worktree metadata](https://git-scm.com/docs/git-worktree#_details): separate common/private Gitdirs and .git pointer.
 - [Docker build contexts](https://docs.docker.com/build/concepts/context/#filesystem-contexts): files available to the build.
 - [Compose project names](https://docs.docker.com/compose/how-tos/project-name/): environment namespace; ports/bind mounts still require explicit isolation.
+- [BuildKit image-ID compatibility issue](https://github.com/moby/buildkit/issues/2204): local image IDs in FROM can be interpreted as repository/tag references; a verified owned named tag avoids that syntax.
 
 Application issue: https://github.com/trdat1605/s-251521f7e9131fb0/issues/2.
 Control task: tasks/COMPLETE-001/task.json in the separate coordination repository.

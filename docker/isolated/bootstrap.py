@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare and operate only a new, project-scoped Chatwoot development snapshot."""
 import argparse
+from contextlib import contextmanager
 import io
 import json
 import os
@@ -18,6 +19,58 @@ import uuid
 BASELINE = "caab07a8f00032d5205b5a5d7e2eb0ba2f3d2d82"
 SHA = re.compile(r"[0-9a-f]{40}")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+# Developer-rule pointer, not runtime input. The local Python 3.10 data filter
+# incorrectly resolves this parent-relative symlink against the archive root.
+# Keep filtering every extracted member; omit only this verified upstream shape.
+ARCHIVE_OMISSIONS = {".windsurf/rules/chatwoot.md": "../../AGENTS.md"}
+
+
+def image_id(reference):
+    actual = run(["docker", "image", "inspect", "--format", "{{.Id}}", reference], capture=True).stdout.strip()
+    if not IMAGE_ID.fullmatch(actual):
+        raise ValueError("Docker did not return an exact image ID")
+    return actual
+
+
+def tag_id(reference):
+    identifiers = set(run(["docker", "image", "ls", "--quiet", "--no-trunc", "--filter",
+                           f"reference={reference}"], capture=True).stdout.split())
+    if not identifiers:
+        return None
+    if len(identifiers) != 1 or not IMAGE_ID.fullmatch(next(iter(identifiers))):
+        raise ValueError("ambiguous local image tag")
+    return next(iter(identifiers))
+
+
+def remove_owned_tag(reference, expected):
+    if not re.fullmatch(r"cwdev-(?:base|regression)-[0-9a-f]{12,32}:[a-z0-9-]+", reference):
+        raise ValueError("refusing to remove a tag outside the generated namespace")
+    actual = tag_id(reference)
+    if actual is None:
+        return
+    if actual != expected:
+        raise ValueError("generated image tag changed identity; left untouched")
+    run(["docker", "image", "rm", reference], capture=True)
+
+
+@contextmanager
+def borrowed_image_tag(selected_id):
+    if not IMAGE_ID.fullmatch(selected_id) or image_id(selected_id) != selected_id:
+        raise ValueError("cached image identity mismatch")
+    reference = f"cwdev-base-{uuid.uuid4().hex}:selected"
+    if tag_id(reference) is not None:
+        raise ValueError("generated temporary image tag already exists")
+    run(["docker", "image", "tag", selected_id, reference], capture=True)
+    try:
+        if tag_id(reference) != selected_id:
+            raise ValueError("temporary build reference does not match selected image")
+        print(f"BASE_IMAGE_VERIFIED {selected_id} {reference}")
+        yield reference
+        if tag_id(reference) != selected_id:
+            raise ValueError("temporary build reference changed during build")
+        print(f"BASE_IMAGE_RECHECKED {selected_id} {reference}")
+    finally:
+        remove_owned_tag(reference, selected_id)
 
 
 def run(args, cwd=None, capture=False, env=None, check=True):
@@ -59,13 +112,19 @@ def archive_source(root, target):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     payload = subprocess.check_output(["git", "-C", str(root), "archive", "--format=tar", "HEAD"], env=environment)
     with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
+        members = []
         for member in archive.getmembers():
+            if member.name in ARCHIVE_OMISSIONS:
+                if not member.issym() or member.linkname != ARCHIVE_OMISSIONS[member.name]:
+                    raise ValueError("known developer-rule archive omission changed; review required")
+                continue
             path = Path(member.name)
             if path.parts[0] in {".git", ".codex"} or path.name == "AGENTS.override.md":
                 raise ValueError("local adapter/metadata must not be tracked in build context")
             if path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example"):
                 raise ValueError("non-example environment file must not enter build context")
-        archive.extractall(target, filter="data")
+            members.append(member)
+        archive.extractall(target, members=members, filter="data")
 
 
 def metadata_block(dockerfile):
@@ -130,7 +189,7 @@ def prepare(root, project, port_base, reuse):
             # Retain dependencies from an explicitly selected image, replace only
             # application source. This is CACHE_REUSE, never a cold/fresh build.
             (context / "docker/isolated/cache.Dockerfile").write_text(
-                f"FROM {reuse}\nWORKDIR /app\n" +
+                "ARG CHATWOOT_BASE_IMAGE\nFROM ${CHATWOOT_BASE_IMAGE}\nWORKDIR /app\n" +
                 "RUN mv /app/node_modules /cached_node_modules && rm -rf /app && mkdir /app\n" +
                 "COPY . /app\nRUN mv /cached_node_modules /app/node_modules\n" +
                 metadata_block((context / "docker/Dockerfile").read_text()) + "\n")
@@ -144,6 +203,7 @@ def prepare(root, project, port_base, reuse):
             "schema": 1, "project": project, "source_commit": head,
             "checkout": str(root), "ports": ports, "reuse_base_image": reuse,
             "dependency_mode": "CACHE_REUSE" if reuse else "FULL_BUILD",
+            "archive_omission_policy": ARCHIVE_OMISSIONS,
         }
         (base / "state.json").write_text(json.dumps(state, indent=2) + "\n")
     except BaseException:
@@ -157,9 +217,11 @@ def read_state(root, project):
     base = state_dir(root, project)
     state = json.loads((base / "state.json").read_text())
     expected = {"schema", "project", "source_commit", "checkout", "ports",
-                "reuse_base_image", "dependency_mode"}
+                "reuse_base_image", "dependency_mode", "archive_omission_policy"}
     if set(state) != expected or state["schema"] != 1:
         raise ValueError("unsupported state")
+    if state["archive_omission_policy"] != ARCHIVE_OMISSIONS:
+        raise ValueError("archive omission policy changed; prepare a new project")
     if state["project"] != project or state["checkout"] != str(root):
         raise ValueError("state does not belong to this project/checkout")
     if state["source_commit"] != source_head(root):
@@ -215,6 +277,18 @@ def owned_ports(project):
     return ports
 
 
+def build_app(root, state):
+    if state["reuse_base_image"]:
+        context = state_dir(root, state["project"]) / "build"
+        image = f"{state['project']}:app-{state['source_commit'][:12]}"
+        with borrowed_image_tag(state["reuse_base_image"]) as reference:
+            run(["docker", "build", "--pull=false", "--file", str(context / "docker/isolated/cache.Dockerfile"),
+                 "--tag", image, "--build-arg", f"CHATWOOT_BASE_IMAGE={reference}",
+                 "--build-arg", f"CHATWOOT_SOURCE_COMMIT={state['source_commit']}", str(context)])
+    else:
+        compose(root, state, ["--profile", "build", "build", "base"])
+
+
 def metadata_regression(root, base_image, baseline):
     if not IMAGE_ID.fullmatch(base_image) or not SHA.fullmatch(baseline):
         raise ValueError("regression requires exact image ID and baseline commit")
@@ -225,28 +299,31 @@ def metadata_regression(root, base_image, baseline):
     if old == new or "RUN git rev-parse HEAD > /app/.git_sha" not in old:
         raise ValueError("baseline must contain the real upstream Git metadata command")
     head = source_head(root)
-    tags = []
+    tags = {}
     fixture = None
     try:
-        with tempfile.TemporaryDirectory(prefix="cwdev-metadata-") as temporary:
+        with borrowed_image_tag(base_image) as build_base, tempfile.TemporaryDirectory(prefix="cwdev-metadata-") as temporary:
             directory = Path(temporary)
             fixture = directory / "linked"
             git(root, "worktree", "add", "--detach", str(fixture), head)
             context = directory / "context"
             context.mkdir()
             shutil.copyfile(fixture / ".git", context / ".git")
-            prefix = f"FROM {base_image}\nWORKDIR /app\nCOPY .git /app/.git\n"
+            prefix = f"FROM {build_base}\nWORKDIR /app\nCOPY .git /app/.git\n"
             tag_prefix = f"cwdev-regression-{uuid.uuid4().hex[:12]}"
 
             def build(suffix, block, commit=None, expect=True):
                 tag = f"{tag_prefix}:{suffix}"
-                tags.append(tag)
+                if tag_id(tag) is not None:
+                    raise ValueError("generated regression image tag already exists")
                 (context / "Dockerfile").write_text(prefix + block + "\n")
                 command = ["docker", "build", "--network=none", "--pull=false", "--no-cache",
                            "--progress=plain", "-t", tag]
                 if commit is not None:
                     command += ["--build-arg", f"CHATWOOT_SOURCE_COMMIT={commit}"]
                 result = run([*command, str(context)], capture=True, check=False)
+                if result.returncode == 0:
+                    tags[tag] = image_id(tag)
                 if expect and result.returncode:
                     raise RuntimeError(result.stdout)
                 return tag, result
@@ -281,7 +358,7 @@ def metadata_regression(root, base_image, baseline):
             print(json.dumps({"baseline": "EXPECTED_FAIL", "explicit_sha": "PASS",
                               "invalid_sha": "REJECTED", "normal_git_fallback": "PASS",
                               "source_commit": head, "baseline_commit": baseline,
-                              "base_image": base_image}, indent=2))
+                              "base_image": base_image, "build_base_reference": build_base}, indent=2))
             git(root, "worktree", "remove", str(fixture))
             fixture = None
     finally:
@@ -289,8 +366,8 @@ def metadata_regression(root, base_image, baseline):
             # Remove only the registration created by this invocation, including
             # on failure after TemporaryDirectory removed its generated path.
             git(root, "worktree", "remove", "--force", str(fixture))
-        for tag in tags:
-            run(["docker", "image", "rm", tag], capture=True, check=False)
+        for tag, expected in tags.items():
+            remove_owned_tag(tag, expected)
 
 
 def main():
@@ -319,7 +396,7 @@ def main():
         elif args.command == "config":
             compose(root, state, ["config", "--quiet"])
         elif args.command == "build":
-            compose(root, state, ["--profile", "build", "build", "base"])
+            build_app(root, state)
             image = f"{state['project']}:app-{state['source_commit'][:12]}"
             actual = run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "cat",
                           image, "/app/.git_sha"], capture=True).stdout.strip()

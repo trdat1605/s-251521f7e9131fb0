@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -91,6 +92,44 @@ class BootstrapTests(unittest.TestCase):
                 bootstrap.archive_source(self.root, Path(target))
             self.assertEqual(list(Path(target).iterdir()), [])
 
+    def test_real_upstream_rule_shape_omitted_and_normal_internal_link_preserved(self):
+        (self.root / "AGENTS.md").write_text("fixture instructions retained")
+        rules = self.root / ".windsurf/rules"
+        rules.mkdir(parents=True)
+        # Exact path/type/target from upstream caab07a8; this is an internal
+        # symlink. Local older tarfile incorrectly treats its target as root-relative.
+        (rules / "chatwoot.md").symlink_to("../../AGENTS.md")
+        (self.root / "CLAUDE.md").symlink_to("AGENTS.md")
+        self.commit()
+        with tempfile.TemporaryDirectory() as target:
+            destination = Path(target)
+            bootstrap.archive_source(self.root, destination)
+            self.assertFalse((destination / ".windsurf/rules/chatwoot.md").is_symlink())
+            self.assertTrue((destination / "AGENTS.md").is_file())
+            self.assertTrue((destination / "CLAUDE.md").is_symlink())
+            self.assertEqual((destination / "CLAUDE.md").readlink(), Path("AGENTS.md"))
+
+    def test_changed_known_rule_shape_fails_closed(self):
+        rules = self.root / ".windsurf/rules"
+        rules.mkdir(parents=True)
+        # Neither a changed link target nor a regular file is silently omitted.
+        for variant in ("../../../AGENTS.md", None):
+            path = rules / "chatwoot.md"
+            if variant is None:
+                path.write_text("changed upstream type")
+            else:
+                path.symlink_to(variant)
+            self.commit()
+            with tempfile.TemporaryDirectory() as target, self.assertRaises(ValueError):
+                bootstrap.archive_source(self.root, Path(target))
+            path.unlink()
+
+    def test_unrelated_external_symlink_still_rejected(self):
+        (self.root / "external-rule").symlink_to("../outside-archive")
+        self.commit()
+        with tempfile.TemporaryDirectory() as target, self.assertRaises(tarfile.LinkOutsideDestinationError):
+            bootstrap.archive_source(self.root, Path(target))
+
     def test_prepare_private_secrets_idempotent_and_stale_ref_rejected(self):
         empty = subprocess.CompletedProcess([], 0, stdout="")
         real_run = bootstrap.run
@@ -136,6 +175,65 @@ class BootstrapTests(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             with self.assertRaises(OSError):
                 bootstrap.check_ports([sock.getsockname()[1]])
+
+    def test_temporary_named_image_reference_verified_and_only_owned_tag_removed(self):
+        selected = "sha256:" + "a" * 64
+        with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "tag_id", side_effect=[None, selected, selected, selected]), \
+                patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
+            with bootstrap.borrowed_image_tag(selected) as reference:
+                self.assertRegex(reference, r"^cwdev-base-[0-9a-f]{32}:selected$")
+                self.assertFalse(reference.startswith("sha256:"))
+        self.assertEqual(invoke.call_args_list[0].args[0], ["docker", "image", "tag", selected, reference])
+        self.assertEqual(invoke.call_args_list[1].args[0], ["docker", "image", "rm", reference])
+
+    def test_retargeted_temporary_tag_is_not_removed(self):
+        selected = "sha256:" + "a" * 64
+        changed = "sha256:" + "b" * 64
+        with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "tag_id", side_effect=[None, selected, changed, changed]), \
+                patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                with bootstrap.borrowed_image_tag(selected):
+                    pass
+        self.assertEqual(len(invoke.call_args_list), 1)  # Only creation, never removal.
+
+    def test_existing_temporary_reference_never_overwritten(self):
+        selected = "sha256:" + "a" * 64
+        with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "tag_id", return_value=selected), \
+                patch.object(bootstrap, "run") as invoke:
+            with self.assertRaises(ValueError):
+                with bootstrap.borrowed_image_tag(selected):
+                    self.fail("existing reference must not enter build context")
+        invoke.assert_not_called()
+
+    def test_build_failure_still_removes_only_its_verified_temporary_tag(self):
+        selected = "sha256:" + "a" * 64
+        with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "tag_id", side_effect=[None, selected, selected]), \
+                patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                with bootstrap.borrowed_image_tag(selected) as reference:
+                    raise RuntimeError("synthetic build failure")
+        self.assertEqual(invoke.call_args_list[-1].args[0], ["docker", "image", "rm", reference])
+        with patch.object(bootstrap, "run") as invoke:
+            with self.assertRaises(ValueError):
+                bootstrap.remove_owned_tag("cwlab-9200023e:base", selected)
+            invoke.assert_not_called()
+
+    def test_cached_build_passes_named_base_reference_and_retains_exact_id_selection(self):
+        selected = "sha256:" + "a" * 64
+        reference = "cwdev-base-" + "c" * 32 + ":selected"
+        state = {"project": "cwdev-test", "source_commit": "b" * 40, "reuse_base_image": selected}
+        with patch.object(bootstrap, "borrowed_image_tag", return_value=contextlib.nullcontext(reference)) as select, \
+                patch.object(bootstrap, "run") as invoke:
+            bootstrap.build_app(self.root, state)
+        select.assert_called_once_with(selected)
+        command = invoke.call_args.args[0]
+        self.assertIn(f"CHATWOOT_BASE_IMAGE={reference}", command)
+        self.assertIn("CHATWOOT_SOURCE_COMMIT=" + "b" * 40, command)
+        self.assertNotIn(f"CHATWOOT_BASE_IMAGE={selected}", command)
 
     def test_symlinked_state_outside_checkout_rejected(self):
         with tempfile.TemporaryDirectory() as other:

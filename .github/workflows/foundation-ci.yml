@@ -1,11 +1,7 @@
 name: Portable foundation checks
 
 on:
-  pull_request:
-    paths:
-      - docker/Dockerfile
-      - docker/isolated/**
-      - .github/workflows/foundation-ci.yml
+  pull_request: {}
   workflow_dispatch:
     inputs:
       frontend_checks:
