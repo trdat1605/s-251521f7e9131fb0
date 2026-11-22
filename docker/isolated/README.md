@@ -130,4 +130,3 @@ Application issue: https://github.com/trdat1605/s-251521f7e9131fb0/issues/2.
 Control task: tasks/COMPLETE-001/task.json in the separate coordination repository.
 Runtime acceptance, browser checks, backup/restore evidence, exact-commit review,
 PR integration and merge/release decisions remain separate recorded steps.
-

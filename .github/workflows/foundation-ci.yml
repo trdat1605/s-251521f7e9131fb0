@@ -60,4 +60,3 @@ jobs:
           pnpm install --frozen-lockfile
       - name: Run focused existing frontend tests
         run: pnpm test app/javascript/shared/helpers/specs/DateHelper.spec.js app/javascript/widget/helpers/specs/urlParamsHelper.spec.js
-
