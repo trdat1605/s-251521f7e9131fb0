@@ -179,18 +179,20 @@ class BootstrapTests(unittest.TestCase):
     def test_temporary_named_image_reference_verified_and_only_owned_tag_removed(self):
         selected = "sha256:" + "a" * 64
         with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", return_value=["fixture:original"]), \
                 patch.object(bootstrap, "tag_id", side_effect=[None, selected, selected, selected]), \
                 patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
             with bootstrap.borrowed_image_tag(selected) as reference:
                 self.assertRegex(reference, r"^cwdev-base-[0-9a-f]{32}:selected$")
                 self.assertFalse(reference.startswith("sha256:"))
         self.assertEqual(invoke.call_args_list[0].args[0], ["docker", "image", "tag", selected, reference])
-        self.assertEqual(invoke.call_args_list[1].args[0], ["docker", "image", "rm", reference])
+        self.assertEqual(invoke.call_args_list[1].args[0], ["docker", "image", "rm", "--no-prune", reference])
 
     def test_retargeted_temporary_tag_is_not_removed(self):
         selected = "sha256:" + "a" * 64
         changed = "sha256:" + "b" * 64
         with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", return_value=["fixture:original"]), \
                 patch.object(bootstrap, "tag_id", side_effect=[None, selected, changed, changed]), \
                 patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(ValueError):
@@ -201,6 +203,7 @@ class BootstrapTests(unittest.TestCase):
     def test_existing_temporary_reference_never_overwritten(self):
         selected = "sha256:" + "a" * 64
         with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", return_value=["fixture:original"]), \
                 patch.object(bootstrap, "tag_id", return_value=selected), \
                 patch.object(bootstrap, "run") as invoke:
             with self.assertRaises(ValueError):
@@ -211,16 +214,54 @@ class BootstrapTests(unittest.TestCase):
     def test_build_failure_still_removes_only_its_verified_temporary_tag(self):
         selected = "sha256:" + "a" * 64
         with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", return_value=["fixture:original"]), \
                 patch.object(bootstrap, "tag_id", side_effect=[None, selected, selected]), \
                 patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(RuntimeError):
                 with bootstrap.borrowed_image_tag(selected) as reference:
                     raise RuntimeError("synthetic build failure")
-        self.assertEqual(invoke.call_args_list[-1].args[0], ["docker", "image", "rm", reference])
+        self.assertEqual(invoke.call_args_list[-1].args[0], ["docker", "image", "rm", "--no-prune", reference])
         with patch.object(bootstrap, "run") as invoke:
             with self.assertRaises(ValueError):
                 bootstrap.remove_owned_tag("cwlab-9200023e:base", selected)
             invoke.assert_not_called()
+
+    def test_untagged_base_image_rejected_without_docker_mutation(self):
+        selected = "sha256:" + "a" * 64
+        with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", return_value=[]), \
+                patch.object(bootstrap, "run") as invoke:
+            with self.assertRaisesRegex(ValueError, "independent named tag"):
+                with bootstrap.borrowed_image_tag(selected):
+                    self.fail("untagged image must never be borrowed")
+        invoke.assert_not_called()
+
+    def test_last_tag_cleanup_refused_when_original_tag_disappears(self):
+        selected = "sha256:" + "a" * 64
+        reference = "cwdev-base-" + "c" * 32 + ":selected"
+        fake_uuid = unittest.mock.Mock(hex="c" * 32)
+        with patch.object(bootstrap, "image_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", side_effect=[["fixture:original"], [reference]]), \
+                patch.object(bootstrap.uuid, "uuid4", return_value=fake_uuid), \
+                patch.object(bootstrap, "tag_id", side_effect=[None, selected, selected, selected]), \
+                patch.object(bootstrap, "run") as invoke, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "temporary tag retained"):
+                with bootstrap.borrowed_image_tag(selected):
+                    pass
+        self.assertEqual(invoke.call_args_list, [unittest.mock.call(
+            ["docker", "image", "tag", selected, reference], capture=True)])
+
+    def test_cleanup_refused_when_independent_tag_resolves_to_another_image(self):
+        selected = "sha256:" + "a" * 64
+        changed = "sha256:" + "b" * 64
+        reference = "cwdev-base-" + "c" * 32 + ":selected"
+        with patch.object(bootstrap, "tag_id", return_value=selected), \
+                patch.object(bootstrap, "image_repo_tags", return_value=[reference, "fixture:original"]), \
+                patch.object(bootstrap, "image_id", return_value=changed), \
+                patch.object(bootstrap, "run") as invoke:
+            with self.assertRaisesRegex(ValueError, "temporary tag retained"):
+                bootstrap.remove_owned_tag(reference, selected, preserve_image=True)
+        invoke.assert_not_called()
 
     def test_cached_build_passes_named_base_reference_and_retains_exact_id_selection(self):
         selected = "sha256:" + "a" * 64

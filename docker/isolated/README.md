@@ -97,6 +97,13 @@ reference, because a local image ID is not a registry digest and BuildKit may
 interpret FROM sha256:... as a repository/tag. Only the generated temporary tag
 is removed, after an ID check; existing lab tags are never retagged or removed.
 If a temporary tag changes identity, cleanup leaves it untouched and fails.
+The caller's base image must already have an independent named tag; untagged
+images are rejected before tag creation. Cleanup also requires another tag still
+resolving to that exact base image ID. If the independent tag disappears or
+changes identity, cleanup fails and retains the temporary tag to preserve the
+pre-existing image object. No permanent tag is added automatically. Concurrent
+external Docker mutations are not isolated; stop them during this operation.
+Owned image-tag removal uses --no-prune to retain any untagged parent images.
 The generated Dockerfile retains those dependencies, removes inherited /app
 source/adapters inside the image, copies the clean source archive and writes
 verified source metadata. This path is recorded as CACHE_REUSE. It proves neither

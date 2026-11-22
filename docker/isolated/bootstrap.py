@@ -42,7 +42,17 @@ def tag_id(reference):
     return next(iter(identifiers))
 
 
-def remove_owned_tag(reference, expected):
+def image_repo_tags(selected_id):
+    tags = json.loads(run(["docker", "image", "inspect", "--format", "{{json .RepoTags}}",
+                           selected_id], capture=True).stdout)
+    if tags is None:
+        return []
+    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+        raise ValueError("Docker returned invalid image tags")
+    return [tag for tag in tags if tag != "<none>:<none>"]
+
+
+def remove_owned_tag(reference, expected, preserve_image=False):
     if not re.fullmatch(r"cwdev-(?:base|regression)-[0-9a-f]{12,32}:[a-z0-9-]+", reference):
         raise ValueError("refusing to remove a tag outside the generated namespace")
     actual = tag_id(reference)
@@ -50,13 +60,19 @@ def remove_owned_tag(reference, expected):
         return
     if actual != expected:
         raise ValueError("generated image tag changed identity; left untouched")
-    run(["docker", "image", "rm", reference], capture=True)
+    if preserve_image:
+        independent = [tag for tag in image_repo_tags(expected) if tag != reference]
+        if not any(image_id(tag) == expected for tag in independent):
+            raise ValueError("base image lost its independent tags; temporary tag retained to preserve image")
+    run(["docker", "image", "rm", "--no-prune", reference], capture=True)
 
 
 @contextmanager
 def borrowed_image_tag(selected_id):
     if not IMAGE_ID.fullmatch(selected_id) or image_id(selected_id) != selected_id:
         raise ValueError("cached image identity mismatch")
+    if not any(image_id(tag) == selected_id for tag in image_repo_tags(selected_id)):
+        raise ValueError("base image must already have an independent named tag")
     reference = f"cwdev-base-{uuid.uuid4().hex}:selected"
     if tag_id(reference) is not None:
         raise ValueError("generated temporary image tag already exists")
@@ -70,7 +86,7 @@ def borrowed_image_tag(selected_id):
             raise ValueError("temporary build reference changed during build")
         print(f"BASE_IMAGE_RECHECKED {selected_id} {reference}")
     finally:
-        remove_owned_tag(reference, selected_id)
+        remove_owned_tag(reference, selected_id, preserve_image=True)
 
 
 def run(args, cwd=None, capture=False, env=None, check=True):
