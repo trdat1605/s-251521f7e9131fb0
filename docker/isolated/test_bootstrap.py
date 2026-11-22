@@ -39,6 +39,28 @@ class BootstrapTests(unittest.TestCase):
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                  "commit", "-m", "fixture")
 
+    def test_frontend_entrypoint_uses_built_dependencies_without_installing(self):
+        entrypoint = Path(__file__).with_name("entrypoint.sh")
+        (self.root / "node_modules/.bin").mkdir(parents=True)
+        vite = self.root / "node_modules/.bin/vite"
+        vite.write_text("#!/bin/sh\necho VITE_READY\n")
+        vite.chmod(0o755)
+        (self.root / "bin").mkdir()
+        launch = self.root / "bin/vite"
+        launch.write_text("#!/bin/sh\nexec node_modules/.bin/vite\n")
+        launch.chmod(0o755)
+        result = subprocess.run(["sh", str(entrypoint), "bin/vite"], cwd=self.root,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "VITE_READY")
+
+    def test_frontend_entrypoint_missing_dependencies_fails_without_prompt(self):
+        entrypoint = Path(__file__).with_name("entrypoint.sh")
+        result = subprocess.run(["sh", str(entrypoint), "bin/vite"], cwd=self.root,
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Frontend dependencies missing", result.stderr)
+
     def test_project_and_port_boundary(self):
         bootstrap.validate_project("cwdev-complete001")
         for project in ("cwlab-9200023e", "course-platform-local", "../cwdev-test",

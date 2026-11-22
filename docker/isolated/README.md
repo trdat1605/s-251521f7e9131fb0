@@ -157,3 +157,5 @@ Application issue: https://github.com/trdat1605/s-251521f7e9131fb0/issues/2.
 Control task: tasks/COMPLETE-001/task.json in the separate coordination repository.
 Runtime acceptance, browser checks, backup/restore evidence, exact-commit review,
 PR integration and merge/release decisions remain separate recorded steps.
+
+Startup uses dependencies already installed into the development image and seeded into its private node_modules volume. It does not run pnpm install on service startup: that operation can prompt to reinstall a relocated modules directory. Missing frontend dependencies fail with a build instruction. Dependency changes require a new image/project, preserving the recorded source snapshot.
